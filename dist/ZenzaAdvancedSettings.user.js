@@ -249,9 +249,649 @@ const {Emitter} = (() => {
 	return {Handler, PromiseHandler, Emitter};
 }
 const {Handler, PromiseHandler, Emitter} = EmitterInitFunc();
-//@require ../packages/lib/src/infra/StorageWriter.js
-//@require ../packages/lib/src/infra/objUtil.js
-//@require ../packages/lib/src/infra/DataStorage.js
+const StorageWriter = (() => {
+	const func = function(self) {
+		self.onmessage = ({command, params}) => {
+			const {obj, replacer, space} = params;
+			return JSON.stringify(obj, replacer || null, space || 0);
+		};
+	};
+	let worker;
+	const prototypePollution = window.Prototype && Array.prototype.hasOwnProperty('toJSON');
+	const toJson = async (obj, replacer = null, space = 0) => {
+		if (!prototypePollution || obj === null || ['string', 'number', 'boolean'].includes(typeof obj)) {
+			return JSON.stringify(obj, replacer, space);
+		}
+		worker = worker || workerUtil.createCrossMessageWorker(func, {name: 'ToJsonWorker'});
+		return worker.post({command: 'toJson', params: {obj, replacer, space}});
+	};
+	const writer = Symbol('StorageWriter');
+	const setItem = (storage, key, value) => {
+		if (!prototypePollution || value === null || ['string', 'number', 'boolean'].includes(typeof value)) {
+			storage.setItem(key, JSON.stringify(value));
+		} else {
+			toJson(value).then(json => storage.setItem(key, json));
+		}
+	};
+	localStorage[writer] = (key, value) => setItem(localStorage, key, value);
+	sessionStorage[writer] = (key, value) => setItem(sessionStorage, key, value);
+	return { writer, toJson };
+})();
+const objUtil = (() => {
+	const isObject = e => e !== null && e instanceof Object;
+	const PROPS = Symbol('PROPS');
+	const REVISION = Symbol('REVISION');
+	const CHANGED = Symbol('CHANGED');
+	const HAS = Symbol('HAS');
+	const SET = Symbol('SET');
+	const GET = Symbol('GET');
+	return {
+		bridge: (self, target, keys = null) => {
+			(keys || Object.getOwnPropertyNames(target.constructor.prototype))
+				.filter(key => typeof target[key] === 'function')
+				.forEach(key => self[key] = target[key].bind(target));
+		},
+		isObject,
+		toMap: (obj, mapper = Map) => {
+			if (obj instanceof mapper) {
+				return obj;
+			}
+			return new mapper(Object.entries(obj));
+		},
+		mapToObj: map => {
+			if (!(map instanceof Map)) {
+				return map;
+			}
+			const obj = {};
+			for (const [key, val] of map) {
+				obj[key] = val;
+			}
+			return obj;
+		},
+	};
+})();
+const Observable = (() => {
+	const observableSymbol = Symbol.observable || Symbol('observable');
+	const nop = Handler.nop;
+	class Subscription {
+		constructor({observable, subscriber, unsubscribe, closed}) {
+			this.callbacks = {unsubscribe, closed};
+			this.observable = observable;
+			const next = subscriber.next.bind(subscriber);
+			subscriber.next = args => {
+				if (this.closed || (this._filterFunc && !this._filterFunc(args))) {
+					return;
+				}
+				return this._mapFunc ? next(this._mapFunc(args)) : next(args);
+			};
+			this._closed = false;
+		}
+		subscribe(subscriber, onError, onCompleted) {
+			return this.observable.subscribe(subscriber, onError, onCompleted)
+				.filter(this._filterFunc)
+				.map(this._mapFunc);
+		}
+		unsubscribe() {
+			this._closed = true;
+			if (this.callbacks.unsubscribe) {
+				this.callbacks.unsubscribe();
+			}
+			return this;
+		}
+		dispose() {
+			return this.unsubscribe();
+		}
+		filter(func) {
+			const _func = this._filterFunc;
+			this._filterFunc = _func ? (arg => _func(arg) && func(arg)) : func;
+			return this;
+		}
+		map(func) {
+			const _func = this._mapFunc;
+			this._mapFunc = _func ? arg => func(_func(arg)) : func;
+			return this;
+		}
+		get closed() {
+			if (this.callbacks.closed) {
+				return this._closed || this.callbacks.closed();
+			} else {
+				return this._closed;
+			}
+		}
+	}
+	class Subscriber {
+		static create(onNext = null, onError = null, onCompleted = null) {
+			if (typeof onNext === 'function') {
+				return new this({
+					next: onNext,
+					error: onError,
+					complete: onCompleted
+				});
+			}
+			return new this(onNext || {});
+		}
+		constructor({start, next, error, complete} = {start:nop, next:nop, error:nop, complete:nop}) {
+			this.callbacks = {start, next, error, complete};
+		}
+		start(arg) {this.callbacks.start(arg);}
+		next(arg) {this.callbacks.next(arg);}
+		error(arg) {this.callbacks.error(arg);}
+		complete(arg) {this.callbacks.complete(arg);}
+		get closed() {
+			return this._callbacks.closed ? this._callbacks.closed() : false;
+		}
+	}
+	Subscriber.nop = {start: nop, next: nop, error: nop, complete: nop, closed: nop};
+	const eleMap = new WeakMap();
+	class Observable {
+		static of(...args) {
+			return new this(o => {
+				for (const arg of args) {
+					o.next(arg);
+				}
+				o.complete();
+				return () => {};
+			});
+		}
+		static from(arg) {
+			if (arg[Symbol.iterator]) {
+				return this.of(...arg);
+			} else if (arg[Observable.observavle]) {
+				return arg[Observable.observavle]();
+			}
+		}
+		static fromEvent(element, eventName) {
+			const em = eleMap.get(element) || {};
+			if (em && em[eventName]) {
+				return em[eventName];
+			}
+			eleMap.set(element, em);
+			return em[eventName] = new this(o => {
+				const onUpdate = e => o.next(e);
+				element.addEventListener(eventName, onUpdate, {passive: true});
+				return () => element.removeEventListener(eventName, onUpdate);
+			});
+		}
+		static interval(ms) {
+			return new this(function(o) {
+				const timer = setInterval(() => o.next(this.i++), ms);
+				return () => clearInterval(timer);
+			}.bind({i: 0}));
+		}
+		constructor(subscriberFunction) {
+			this._subscriberFunction = subscriberFunction;
+			this._completed = false;
+			this._cancelled = false;
+			this._handlers = new Handler();
+		}
+		_initSubscriber() {
+			if (this._subscriber) {
+				return;
+			}
+			const handlers = this._handlers;
+			this._completed = this._cancelled = false;
+			return this._subscriber = new Subscriber({
+				start: arg => handlers.execMethod('start', arg),
+				next: arg => handlers.execMethod('next', arg),
+				error: arg => handlers.execMethod('error', arg),
+				complete: arg => {
+					if (this._nextObservable) {
+						this._nextObservable.subscribe(this._subscriber);
+						this._nextObservable = this._nextObservable._nextObservable;
+					} else {
+						this._completed = true;
+						handlers.execMethod('complete', arg);
+					}
+				},
+				closed: () => this.closed
+			});
+		}
+		get closed() {
+			return this._completed || this._cancelled;
+		}
+		filter(func) {
+			return this.subscribe().filter(func);
+		}
+		map(func) {
+			return this.subscribe().map(func);
+		}
+		concat(arg) {
+			const observable = Observable.from(arg);
+			if (this._nextObservable) {
+				this._nextObservable.concat(observable);
+			} else {
+				this._nextObservable = observable;
+			}
+			return this;
+		}
+		forEach(callback) {
+			let p = new PromiseHandler();
+			callback(p);
+			return this.subscribe({
+				next: arg => {
+					const lp = p;
+					p = new PromiseHandler();
+					lp.resolve(arg);
+					callback(p);
+				},
+				error: arg => {
+					const lp = p;
+					p = new PromiseHandler();
+					lp.reject(arg);
+					callback(p);
+			}});
+		}
+		onStart(arg) { this._subscriber.start(arg); }
+		onNext(arg) { this._subscriber.next(arg); }
+		onError(arg) { this._subscriber.error(arg); }
+		onComplete(arg) { this._subscriber.complete(arg);}
+		disconnect() {
+			if (!this._disconnectFunction) {
+				return;
+			}
+			this._closed = true;
+			this._disconnectFunction();
+			delete this._disconnectFunction;
+			this._subscriber;
+			this._handlers.clear();
+		}
+		[observableSymbol]() {
+			return this;
+		}
+		subscribe(onNext = null, onError = null, onCompleted = null) {
+			this._initSubscriber();
+			const isNop = [onNext, onError, onCompleted].every(f => f === null);
+			const subscriber = Subscriber.create(onNext, onError, onCompleted);
+			return this._subscribe({subscriber, isNop});
+		}
+		_subscribe({subscriber, isNop}) {
+			if (!isNop && !this._disconnectFunction) {
+				this._disconnectFunction = this._subscriberFunction(this._subscriber);
+			}
+			!isNop && this._handlers.add(subscriber);
+			return new Subscription({
+				observable: this,
+				subscriber,
+				unsubscribe: () => {
+					if (isNop) { return; }
+					this._handlers.remove(subscriber);
+					if (this._handlers.isEmpty) {
+						this.disconnect();
+					}
+				},
+				closed: () => this.closed
+			});
+		}
+	}
+	Observable.observavle = observableSymbol;
+	return Observable;
+})();
+const WindowResizeObserver = Observable.fromEvent(window, 'resize')
+	.map(o => { return {width: window.innerWidth, height: window.innerHeight}; });
+const bounce = {
+	origin: Symbol('origin'),
+	idle(func, time) {
+		let reqId = null;
+		let lastArgs = null;
+		let promise = new PromiseHandler();
+		const [caller, canceller] =
+			(time === undefined && self.requestIdleCallback) ?
+				[self.requestIdleCallback, self.cancelIdleCallback] : [self.setTimeout, self.clearTimeout];
+		const callback = () => {
+			const lastResult = func(...lastArgs);
+			promise.resolve({lastResult, lastArgs});
+			reqId = lastArgs = null;
+			promise = new PromiseHandler();
+		};
+		const result = (...args) => {
+			if (reqId) {
+				reqId = canceller(reqId);
+			}
+			lastArgs = args;
+			reqId = caller(callback, time);
+			return promise;
+		};
+		result[this.origin] = func;
+		return result;
+	},
+	time(func, time = 0) {
+		return this.idle(func, time);
+	}
+};
+const throttle = (func, interval) => {
+	let lastTime = 0;
+	let timer;
+	let promise = new PromiseHandler();
+	const result = (...args) => {
+		if (timer) {
+			return promise;
+		}
+		const now = performance.now();
+		const timeDiff = now - lastTime;
+		timer = setTimeout(() => {
+			lastTime = performance.now();
+			timer = null;
+			const lastResult = func(...args);
+			promise.resolve({lastResult, lastArgs: args});
+			promise = new PromiseHandler();
+		}, Math.max(interval - timeDiff, 0));
+		return promise;
+	};
+	result.cancel = () => {
+		if (timer) {
+			timer = clearTimeout(timer);
+		}
+		promise.resolve({lastResult: null, lastArgs: null});
+		promise = new PromiseHandler();
+	};
+	return result;
+};
+throttle.time = (func, interval = 0) => throttle(func, interval);
+throttle.raf = function(func) {
+	let promise;
+	let cancelled = false;
+	let lastArgs = [];
+	const callRaf = res => requestAnimationFrame(res);
+	const onRaf = () => this.req = null;
+	const onCall = () => {
+		if (cancelled) {
+			cancelled = false;
+			return;
+		}
+		try { func(...lastArgs); } catch (e) { console.warn(e); }
+		promise = null;
+	};
+	const result = (...args) => {
+		lastArgs = args;
+		if (promise) {
+			return promise;
+		}
+		if (!this.req) {
+			this.req = new Promise(callRaf).then(onRaf);
+		}
+		promise = this.req.then(onCall);
+		return promise;
+	};
+	result.cancel = () => {
+		cancelled = true;
+		promise = null;
+	};
+	return result;
+}.bind({req: null, count: 0, id: 0});
+throttle.idle = func => {
+	let id;
+	const request = (self.requestIdleCallback || self.setTimeout);
+	const cancel = (self.cancelIdleCallback || self.clearTimeout);
+	const result = (...args) => {
+		if (id) {
+			return;
+		}
+		id = request(() => {
+			id = null;
+			func(...args);
+		}, 0);
+	};
+	result.cancel = () => {
+		if (id) {
+			id = cancel(id);
+		}
+	};
+	return result;
+};
+class DataStorage {
+	static create(defaultData, options = {}) {
+		return new DataStorage(defaultData, options);
+	}
+	static clone(dataStorage) {
+		const options = {
+			prefix:  dataStorage.prefix,
+			storage: dataStorage.storage,
+			ignoreExportKeys: dataStorage.options.ignoreExportKeys,
+			readonly: dataStorage.readonly
+		};
+		return DataStorage.create(dataStorage.default, options);
+	}
+	constructor(defaultData, options = {}) {
+		this.options = options;
+		this.default = defaultData;
+		this._data = Object.assign({}, defaultData);
+		this.prefix = `${options.prefix || 'DATA'}_`;
+		this.storage = options.storage || localStorage;
+		this._ignoreExportKeys = options.ignoreExportKeys || [];
+		this.readonly = options.readonly;
+		this.silently = false;
+		this._changed = new Map();
+		this._onChange = bounce.time(this._onChange.bind(this));
+		objUtil.bridge(this, new Emitter());
+		this.restore().then(() => {
+			this.props = this._makeProps(defaultData);
+			this.emitResolve('restore');
+		});
+		this.logger = (self || window).console;
+		this.consoleSubscriber = {
+			next: (v, ...args) => this.logger.log('next', v, ...args),
+			error: (e, ...args) => this.logger.warn('error', e, ...args),
+			complete: (c, ...args) => this.logger.log('complete', c, ...args)
+		};
+	}
+	_makeProps(defaultData = {}, namespace = '') {
+		namespace = namespace ? `${namespace}.` : '';
+		const self = this;
+		const def = {};
+		const props = {};
+		Object.keys(defaultData).sort()
+			.filter(key => key.includes(namespace))
+			.forEach(key => {
+				const k = key.slice(namespace.length);
+				if (k.includes('.')) {
+					const ns = k.slice(0, k.indexOf('.'));
+					props[ns] = this._makeProps(defaultData, `${namespace}${ns}`);
+				}
+				def[k] = {
+					enumerable: !this._ignoreExportKeys.includes(key),
+					get() { return self.getValue(key); },
+					set(v) { self.setValue(key, v); }
+				};
+		});
+		Object.defineProperties(props, def);
+		return props;
+	}
+	_onChange() {
+		const changed = this._changed;
+		this.emit('change', changed);
+		for (const [key, val] of changed) {
+			this.emitAsync('update', key, val);
+			this.emitAsync(`update-${key}`, val);
+		}
+		this._changed.clear();
+	}
+	onkey(key, callback) {
+		this.on(`update-${key}`, callback);
+	}
+	offkey(key, callback) {
+		this.off(`update-${key}`, callback);
+	}
+	async restore(storage) {
+		storage = storage || this.storage;
+		Object.keys(this.default).forEach(key => {
+			const storageKey = this.getStorageKey(key);
+			if (storage.hasOwnProperty(storageKey) || storage[storageKey] !== undefined) {
+				try {
+					this._data[key] = JSON.parse(storage[storageKey]);
+				} catch (e) {
+					console.error('config parse error key:"%s" value:"%s" ', key, storage[storageKey], e);
+					delete storage[storageKey];
+					this._data[key] = this.default[key];
+				}
+			} else {
+				this._data[key] = this.default[key];
+			}
+		});
+	}
+	getNativeKey(key) {
+		return key;
+	}
+	getStorageKey(key) {
+		return `${this.prefix}${key}`;
+	}
+	async refresh(key, storage) {
+		storage = storage || this.storage;
+		key = this.getNativeKey(key);
+		const storageKey = this.getStorageKey(key);
+		if (storage.hasOwnProperty(storageKey) || storage[storageKey] !== undefined) {
+			try {
+				this._data[key] = JSON.parse(storage[storageKey]);
+			} catch (e) {
+				console.error('config parse error key:"%s" value:"%s" ', key, storage[storageKey], e);
+			}
+		}
+		return this._data[key];
+	}
+	getValue(key) {
+		key = this.getNativeKey(key);
+		return this._data[key];
+	}
+	deleteValue(key) {
+		key = this.getNativeKey(key);
+		const storageKey = this.getStorageKey(key);
+		this.storage.removeItem(storageKey);
+		this._data[key] = this.default[key];
+	}
+	setValue(key, value) {
+		const _key = key;
+		key = this.getNativeKey(key);
+		if (this._data[key] === value || value === undefined) {
+			return;
+		}
+		const storageKey = this.getStorageKey(key);
+		const storage = this.storage;
+		if (!this.readonly) {
+			try {
+				storage[storageKey] = JSON.stringify(value);
+			} catch (e) {
+				window.console.error(e);
+			}
+		}
+		this._data[key] = value;
+		if (!this.silently) {
+			this._changed.set(_key, value);
+			this._onChange();
+		}
+	}
+	setValueSilently(key, value) {
+		const isSilent = this.silently;
+		this.silently = true;
+		this.setValue(key, value);
+		this.silently = isSilent;
+	}
+	export(isAll = false) {
+		const result = {};
+		const _default = this.default;
+		Object.keys(this.props)
+			.filter(key => isAll || (_default[key] !== this._data[key]))
+			.forEach(key => result[key] = this.getValue(key));
+		return result;
+	}
+	exportJson() {
+		return JSON.stringify(this.export(), null, 2);
+	}
+	import(data) {
+		Object.keys(this.props)
+			.forEach(key => {
+				const val = data.hasOwnProperty(key) ? data[key] : this.default[key];
+				console.log('import data: %s=%s', key, val);
+				this.setValueSilently(key, val);
+		});
+	}
+	importJson(json) {
+		this.import(JSON.parse(json));
+	}
+	getKeys() {
+		return Object.keys(this.props);
+	}
+	clearConfig() {
+		this.silently = true;
+		const storage = this.storage;
+		Object.keys(this.default)
+			.filter(key => !this._ignoreExportKeys.includes(key)).forEach(key => {
+				const storageKey = this.getStorageKey(key);
+				try {
+					if (storage.hasOwnProperty(storageKey) || storage[storageKey] !== undefined) {
+						console.nicoru('delete storage', storageKey, storage[storageKey]);
+						delete storage[storageKey];
+					}
+					this._data[key] = this.default[key];
+				} catch (e) {}
+		});
+		this.silently = false;
+	}
+	namespace(name) {
+		const namespace = name ? `${name}.` : '';
+		const origin = Symbol(`${namespace}`);
+		const result = {
+			getValue: key => this.getValue(`${namespace}${key}`),
+			setValue: (key, value) => this.setValue(`${namespace}${key}`, value),
+			on: (key, func) => {
+				if (key === 'update') {
+					const onUpdate = (key, value) => {
+						if (key.startsWith(namespace)) {
+							func(key.slice(namespace.length + 1), value);
+						}
+					};
+					onUpdate[origin] = func;
+					this.on('update', onUpdate);
+					return result;
+				}
+				return this.onkey(`${namespace}${key}`, func);
+			},
+			off: (key, func) => {
+				if (key === 'update') {
+					func = func[origin] || func;
+					this.off('update', func);
+					return result;
+				}
+				return this.offkey(`${namespace}${key}`, func);
+			},
+			onkey: (key, func) => {
+				this.on(`update-${namespace}${key}`, func);
+				return result;
+			},
+			offkey: (key, func) => {
+				this.off(`update-${namespace}${key}`, func);
+				return result;
+			},
+			props: this.props[name],
+			refresh: () => this.refresh(),
+			subscribe: subscriber => {
+				return this.subscribe(subscriber)
+					.filter(changed => changed.keys().some(k => k.startsWith(namespace)))
+					.map(changed => {
+						const result = new Map;
+						for (const k of changed.keys()) {
+							k.startsWith(namespace) && result.set(k, changed.get(k));
+						}
+						return result;
+					});
+			}
+		};
+		return result;
+	}
+	subscribe(subscriber) {
+		subscriber = subscriber || this.consoleSubscriber;
+		const observable = new Observable(o => {
+			const onChange = changed => o.next(changed);
+			this.on('change', onChange);
+			return () => this.off('change', onChange);
+		});
+		return observable.subscribe(subscriber);
+	}
+	watch() {
+	}
+	unwatch() {
+		this.consoleSubscription && this.consoleSubscription.unsubscribe();
+		this.consoleSubscription = null;
+	}
+}
 const Config = (() => {
 	const DEFAULT_CONFIG = {
 		debug: false,
