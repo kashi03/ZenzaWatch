@@ -2065,33 +2065,66 @@ const nicoUtil = {
 		try {
 			const result = textUtil.parseQuery(query);
 			const playlist = JSON.parse(textUtil.decodeBase64(result.playlist) || '{}');
-			if (playlist.searchQuery) {
-				const sq = playlist.searchQuery;
-				if (sq.type === 'tag') {
+			const context = playlist.context;
+			if (playlist.type === 'search') {
+				if (context.hasOwnProperty('tag')) {
 					result.playlist_type = 'tag';
-					result.tag = sq.query;
+					result.tag = context.tag;
 				} else {
 					result.playlist_type = 'search';
-					result.keyword = sq.query;
+					result.keyword = context.keyword;
 				}
-				let [order, sort] = (sq.sort || '+f').split('');
-				result.order = order === '-' ? 'a' : 'd';
-				result.sort = sort;
-				if (sq.fRange) { result.f_range = sq.fRange; }
-				if (sq.lRange) { result.l_range = sq.lRange; }
-			} else if (playlist.mylistId) {
+				result.order = context.sortOrder === 'asc' ? 'a' : 'd';
+				result.sort = ((sortKey) => {
+					switch (sortKey) {
+						case 'hotLikeAndMylist': return 'h';
+						case 'personalized': return 'p';
+						case 'registeredAt': return 'f';
+						case 'viewCount': return 'v';
+						case 'mylistCount': return 'm';
+						case 'lastCommentTime': return 'n';
+						case 'commentCount': return 'r';
+						case 'duration': return 'l';
+					}
+				})(context.sortKey);
+				const F_RANGE = {
+					U_1H: 4,
+					U_24H: 1,
+					U_1W: 2,
+					U_30D: 3
+				};
+				const L_RANGE = {
+					U_5MIN: 1,
+					O_20MIN: 2
+				};
+				if (context.minRegisteredAt) {
+					result.f_range = (time => {
+						const now = Date.now();
+						if (time > now - 1000 * 60 * 60 * 24 * 30) {
+							return F_RANGE.U_30D;
+						} else if (time > now - 1000 * 60 * 60 * 24 * 7) {
+							return F_RANGE.U_1W;
+						} else if (time > now - 1000 * 60 * 60 * 24) {
+							return F_RANGE.U_24H;
+						} else if (time > now - 1000 * 60 * 60) {
+							return F_RANGE.U_1H;
+						}
+					})(new Date(context.minRegisteredAt).getTime());
+				}
+				if (context.maxDuration || context.minDuration) {
+					result.l_range = context.maxDuration === 300 ? L_RANGE.U_5MIN : L_RANGE.O_20MIN;
+				}
+				return result;
+			}
+			if (playlist.type === 'mylist') {
 				result.playlist_type = 'mylist';
-				result.group_id = playlist.mylistId;
-				result.order =
-					document.querySelector('select[name="sort"]') ?
-						document.querySelector('select[name="sort"]').value : '1';
-			} else if (playlist.id && playlist.id.includes('temporary_mylist')) {
+				result.group_id = context.mylistId;
+			} else if (playlist.type === 'watchlater') {
 				result.playlist_type = 'deflist';
 				result.group_id = 'deflist';
-				result.order =
-					document.querySelector('select[name="sort"]') ?
-						document.querySelector('select[name="sort"]').value : '1';
 			}
+			result.order = context.sortOrder;
+			result.sort = context.sortKey;
 			return result;
 		} catch(e) {
 			return {};
@@ -2515,225 +2548,8 @@ const StorageWriter = (() => {
 	sessionStorage[writer] = (key, value) => setItem(sessionStorage, key, value);
 	return { writer, toJson };
 })();
-const Observable = (() => {
-	const observableSymbol = Symbol.observable || Symbol('observable');
-	const nop = Handler.nop;
-	class Subscription {
-		constructor({observable, subscriber, unsubscribe, closed}) {
-			this.callbacks = {unsubscribe, closed};
-			this.observable = observable;
-			const next = subscriber.next.bind(subscriber);
-			subscriber.next = args => {
-				if (this.closed || (this._filterFunc && !this._filterFunc(args))) {
-					return;
-				}
-				return this._mapFunc ? next(this._mapFunc(args)) : next(args);
-			};
-			this._closed = false;
-		}
-		subscribe(subscriber, onError, onCompleted) {
-			return this.observable.subscribe(subscriber, onError, onCompleted)
-				.filter(this._filterFunc)
-				.map(this._mapFunc);
-		}
-		unsubscribe() {
-			this._closed = true;
-			if (this.callbacks.unsubscribe) {
-				this.callbacks.unsubscribe();
-			}
-			return this;
-		}
-		dispose() {
-			return this.unsubscribe();
-		}
-		filter(func) {
-			const _func = this._filterFunc;
-			this._filterFunc = _func ? (arg => _func(arg) && func(arg)) : func;
-			return this;
-		}
-		map(func) {
-			const _func = this._mapFunc;
-			this._mapFunc = _func ? arg => func(_func(arg)) : func;
-			return this;
-		}
-		get closed() {
-			if (this.callbacks.closed) {
-				return this._closed || this.callbacks.closed();
-			} else {
-				return this._closed;
-			}
-		}
-	}
-	class Subscriber {
-		static create(onNext = null, onError = null, onCompleted = null) {
-			if (typeof onNext === 'function') {
-				return new this({
-					next: onNext,
-					error: onError,
-					complete: onCompleted
-				});
-			}
-			return new this(onNext || {});
-		}
-		constructor({start, next, error, complete} = {start:nop, next:nop, error:nop, complete:nop}) {
-			this.callbacks = {start, next, error, complete};
-		}
-		start(arg) {this.callbacks.start(arg);}
-		next(arg) {this.callbacks.next(arg);}
-		error(arg) {this.callbacks.error(arg);}
-		complete(arg) {this.callbacks.complete(arg);}
-		get closed() {
-			return this._callbacks.closed ? this._callbacks.closed() : false;
-		}
-	}
-	Subscriber.nop = {start: nop, next: nop, error: nop, complete: nop, closed: nop};
-	const eleMap = new WeakMap();
-	class Observable {
-		static of(...args) {
-			return new this(o => {
-				for (const arg of args) {
-					o.next(arg);
-				}
-				o.complete();
-				return () => {};
-			});
-		}
-		static from(arg) {
-			if (arg[Symbol.iterator]) {
-				return this.of(...arg);
-			} else if (arg[Observable.observavle]) {
-				return arg[Observable.observavle]();
-			}
-		}
-		static fromEvent(element, eventName) {
-			const em = eleMap.get(element) || {};
-			if (em && em[eventName]) {
-				return em[eventName];
-			}
-			eleMap.set(element, em);
-			return em[eventName] = new this(o => {
-				const onUpdate = e => o.next(e);
-				element.addEventListener(eventName, onUpdate, {passive: true});
-				return () => element.removeEventListener(eventName, onUpdate);
-			});
-		}
-		static interval(ms) {
-			return new this(function(o) {
-				const timer = setInterval(() => o.next(this.i++), ms);
-				return () => clearInterval(timer);
-			}.bind({i: 0}));
-		}
-		constructor(subscriberFunction) {
-			this._subscriberFunction = subscriberFunction;
-			this._completed = false;
-			this._cancelled = false;
-			this._handlers = new Handler();
-		}
-		_initSubscriber() {
-			if (this._subscriber) {
-				return;
-			}
-			const handlers = this._handlers;
-			this._completed = this._cancelled = false;
-			return this._subscriber = new Subscriber({
-				start: arg => handlers.execMethod('start', arg),
-				next: arg => handlers.execMethod('next', arg),
-				error: arg => handlers.execMethod('error', arg),
-				complete: arg => {
-					if (this._nextObservable) {
-						this._nextObservable.subscribe(this._subscriber);
-						this._nextObservable = this._nextObservable._nextObservable;
-					} else {
-						this._completed = true;
-						handlers.execMethod('complete', arg);
-					}
-				},
-				closed: () => this.closed
-			});
-		}
-		get closed() {
-			return this._completed || this._cancelled;
-		}
-		filter(func) {
-			return this.subscribe().filter(func);
-		}
-		map(func) {
-			return this.subscribe().map(func);
-		}
-		concat(arg) {
-			const observable = Observable.from(arg);
-			if (this._nextObservable) {
-				this._nextObservable.concat(observable);
-			} else {
-				this._nextObservable = observable;
-			}
-			return this;
-		}
-		forEach(callback) {
-			let p = new PromiseHandler();
-			callback(p);
-			return this.subscribe({
-				next: arg => {
-					const lp = p;
-					p = new PromiseHandler();
-					lp.resolve(arg);
-					callback(p);
-				},
-				error: arg => {
-					const lp = p;
-					p = new PromiseHandler();
-					lp.reject(arg);
-					callback(p);
-			}});
-		}
-		onStart(arg) { this._subscriber.start(arg); }
-		onNext(arg) { this._subscriber.next(arg); }
-		onError(arg) { this._subscriber.error(arg); }
-		onComplete(arg) { this._subscriber.complete(arg);}
-		disconnect() {
-			if (!this._disconnectFunction) {
-				return;
-			}
-			this._closed = true;
-			this._disconnectFunction();
-			delete this._disconnectFunction;
-			this._subscriber;
-			this._handlers.clear();
-		}
-		[observableSymbol]() {
-			return this;
-		}
-		subscribe(onNext = null, onError = null, onCompleted = null) {
-			this._initSubscriber();
-			const isNop = [onNext, onError, onCompleted].every(f => f === null);
-			const subscriber = Subscriber.create(onNext, onError, onCompleted);
-			return this._subscribe({subscriber, isNop});
-		}
-		_subscribe({subscriber, isNop}) {
-			if (!isNop && !this._disconnectFunction) {
-				this._disconnectFunction = this._subscriberFunction(this._subscriber);
-			}
-			!isNop && this._handlers.add(subscriber);
-			return new Subscription({
-				observable: this,
-				subscriber,
-				unsubscribe: () => {
-					if (isNop) { return; }
-					this._handlers.remove(subscriber);
-					if (this._handlers.isEmpty) {
-						this.disconnect();
-					}
-				},
-				closed: () => this.closed
-			});
-		}
-	}
-	Observable.observavle = observableSymbol;
-	return Observable;
-})();
-const WindowResizeObserver = Observable.fromEvent(window, 'resize')
-	.map(o => { return {width: window.innerWidth, height: window.innerHeight}; });
-// already required
+//@require Observable
+//@require bounce
 class DataStorage {
 	static create(defaultData, options = {}) {
 		return new DataStorage(defaultData, options);
