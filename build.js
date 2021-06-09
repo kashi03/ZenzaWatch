@@ -194,8 +194,7 @@ function requireFile(srcDir, file, params, parent = '') {
         return true;
       }
 
-      if ((params.dev && line.match(/^\s*\/\/@dev-require (.+)$/)) ||
-          line.match(/^\s*\/\/@require (.+)$/)) {
+      if ((params.dev && line.match(/^\s*\/\/@dev-require (.+)/)) || line.match(/^\s*\/\/@require (.+)/)) {
         const m = (RegExp.$1 || '').trim()
         var f = path.join(path.dirname(srcFile), imports[m] || m);
         // imports[m] ? console.log('import ' + f) : console.log('require ' + f);
@@ -288,8 +287,7 @@ function loadTemplateFile(srcDir, indexFile, outFile, params) {
       }
       return;
     } else
-    if ((params.dev && line.match(/^\s*\/\/@dev-require (.+)/)) ||
-      line.match(/^\s*\/\/@require (.+)/)) {
+    if ((params.dev && line.match(/^\s*\/\/@dev-require (.+)/)) || line.match(/^\s*\/\/@require (.+)/)) {
       const m = (RegExp.$1 || '').trim()
       var f = path.join(path.dirname(srcFile), imports[m] || m);
       // imports[m] ? console.log('import ' + f) : console.log('require ' + f);
