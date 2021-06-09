@@ -263,7 +263,7 @@ function loadTemplateFile(srcDir, indexFile, outFile, params) {
       return;
     }
     if (params.dev) {
-      if (line.match(/^\/\/\s*@([a-z0-9+]+)(.*)$/)) {
+      if (line.match(/^\/\/\s*@([a-z0-9+]+)(.*)/)) {
         let name = RegExp.$1;
         // console.log('header:', indexFile, name, RegExp.$2);
         if (DEV_HEADER[indexFile][name]) {
@@ -274,11 +274,11 @@ function loadTemplateFile(srcDir, indexFile, outFile, params) {
     if (line.match(/\/\/ *==\/UserScript==/)) {
       line +='\n/* eslint-disable */';
     }
-    if (line.match(/^(\s*)\/\/\s*@environment$/)) {
+    if (line.match(/^(\s*)\/\/\s*@environment/)) {
       lines.push(`${RegExp.$1}const ENV = '${params.dev ? 'DEV' : 'STABLE'}';\n`);
       return;
     }
-    if (line.match(/^(\s*)\/\/\s*@version(.*)$/)) {
+    if (line.match(/^(\s*)\/\/\s*@version(.*)/)) {
       if (!ver) {
         ver = RegExp.$2.trim();
         console.log('ver: ' + ver);
@@ -288,8 +288,8 @@ function loadTemplateFile(srcDir, indexFile, outFile, params) {
       }
       return;
     } else
-    if ((params.dev && line.match(/^\s*\/\/@dev-require (.+)$/)) ||
-      line.match(/^\s*\/\/@require (.+)$/)) {
+    if ((params.dev && line.match(/^\s*\/\/@dev-require (.+)/)) ||
+      line.match(/^\s*\/\/@require (.+)/)) {
       const m = (RegExp.$1 || '').trim()
       var f = path.join(path.dirname(srcFile), imports[m] || m);
       // imports[m] ? console.log('import ' + f) : console.log('require ' + f);
