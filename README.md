@@ -1,3 +1,5 @@
+自分用に変更したZenzaWatch
+
 # ZenzaWatch
 
 Ginzaから独立して単体で動くHTML5版ニコニコ動画プレイヤーです。
